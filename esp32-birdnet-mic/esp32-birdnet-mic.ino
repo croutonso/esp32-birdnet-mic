@@ -111,8 +111,8 @@ static const unsigned long TEMPERATURE_CHECK_INTERVAL_MS = 5000UL;
     defined(ARDUINO_XIAO_ESP32C5) || defined(ARDUINO_XIAO_ESP32C6)
 static constexpr int I2S_MCLK_PIN = D7;
 static constexpr int I2S_BCLK_PIN = D3;
-static constexpr int I2S_LRCLK_PIN = D1;
-static constexpr int I2S_DOUT_PIN = D2;
+static constexpr int I2S_LRCLK_PIN = D2;
+static constexpr int I2S_DOUT_PIN = D10;
 #else
 static constexpr int I2S_MCLK_PIN = 7;
 static constexpr int I2S_BCLK_PIN = 21;
