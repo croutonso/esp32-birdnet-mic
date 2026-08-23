@@ -1,0 +1,136 @@
+# .github/workflows/sync-upstream-and-build.yml
+#
+# Lives in YOUR fork of Sukecz/esp32-birdnet-mic.
+#
+# What it does, every scheduled run:
+#   1. Finds the newest tag on the upstream repo.
+#   2. If your branch doesn't already contain it, merges it in.
+#   3. Compiles the merged source for XIAO ESP32-C6.
+#   4. Publishes the app-only .bin as a GitHub Release on YOUR fork.
+#
+# You then download that .bin from your fork's Releases page and upload it
+# through birdbox2.5's own Web UI at http://<device-ip>/ota - no source
+# editing, no Arduino IDE, no USB.
+#
+# One-time setup before the first run:
+#   - Your 2-line pin fix (I2S_LRCLK_PIN, I2S_DOUT_PIN) must already be
+#     committed on this branch.
+#   - Actions must be enabled on your fork (Actions tab -> enable).
+#
+# If a scheduled run ever fails with a merge conflict, it's because upstream
+# touched one of the same lines your pin fix touches. Fix it once locally:
+#   git fetch upstream --tags && git merge <the tag it failed on>
+# resolve the 1-2 line conflict, push, and the next scheduled run resumes
+# normally from there.
+
+name: sync-upstream-and-build
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'   # weekly, Mondays ~6am Pacific - change to '0 13 * * *' for daily
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if nothing new upstream (use for the first run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history - needed to merge against upstream tags
+
+      - name: Configure git identity for the bot commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream https://github.com/Sukecz/esp32-birdnet-mic.git
+          git fetch upstream --tags
+
+      - name: Find newest upstream release tag
+        id: latest
+        run: |
+          TAG=$(git for-each-ref --sort=-creatordate --format '%(refname:short)' 'refs/tags/v*' | head -1)
+          echo "Newest upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether a build is needed
+        id: check
+        run: |
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "Forced build requested"
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "${{ steps.latest.outputs.tag }}" HEAD; then
+            echo "Already up to date with ${{ steps.latest.outputs.tag }}, nothing to do"
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release available: ${{ steps.latest.outputs.tag }}"
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge the new release into your branch
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          git merge --no-edit "${{ steps.latest.outputs.tag }}" || {
+            echo "::error::Merge conflict pulling ${{ steps.latest.outputs.tag }}. Resolve locally (see file header for the commands), push, then re-run this workflow."
+            exit 1
+          }
+
+      - name: Set up Arduino CLI
+        if: steps.check.outputs.need_build == 'true'
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and libraries
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install WiFiManager
+          arduino-cli lib install PubSubClient
+
+      - name: Compile for XIAO ESP32-C6
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 \
+            --export-binaries esp32-birdnet-mic
+
+      - name: Show build output
+        # First run only: confirm this filename matches what actually got
+        # exported before trusting the "Prepare release asset" step below.
+        if: steps.check.outputs.need_build == 'true'
+        run: find esp32-birdnet-mic/build -maxdepth 2 -type f
+
+      - name: Prepare release asset
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          cp esp32-birdnet-mic/build/esp32.esp32.XIAO_ESP32C6/esp32-birdnet-mic.ino.bin \
+             firmware-app-c6.bin
+
+      - name: Push merged source to your fork
+        if: steps.check.outputs.need_build == 'true'
+        run: git push origin HEAD:main
+
+      - name: Publish as a GitHub Release
+        if: steps.check.outputs.need_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: custom-${{ steps.latest.outputs.tag }}
+          name: birdbox2.5 build (upstream ${{ steps.latest.outputs.tag }})
+          body: |
+            Auto-built from Sukecz/esp32-birdnet-mic ${{ steps.latest.outputs.tag }}
+            with your custom I2S pin overrides (WS -> D2, SD -> D10) applied.
+
+            Download firmware-app-c6.bin below and upload it at
+            http://<birdbox2.5-ip>/ota -> "Upload compiled file".
+          files: firmware-app-c6.bin
