@@ -86,6 +86,30 @@ jobs:
             exit 1
           }
 
+      - name: Keep upstream's own CI workflow out of the pushed commit
+        # GITHUB_TOKEN can never be granted write access to .github/workflows/
+        # files - there's no permission key that turns this on, it's a fixed
+        # GitHub security boundary. Upstream has its own CI file at
+        # .github/workflows/arduino-build.yml; the merge above brings in
+        # whatever changes they made to it, but you don't run that workflow
+        # here, so just put it back to what's already live on your repo
+        # (origin/main, fetched by the checkout step above) and push only
+        # your actual source changes.
+        #
+        # Using origin/main here rather than HEAD^1 matters: HEAD^1 only
+        # means "state before the merge" if the merge actually produced a
+        # two-parent commit. If it ever fast-forwards instead, HEAD^1 means
+        # something else entirely and this step would silently do nothing -
+        # origin/main is correct regardless of how the merge landed.
+        #
+        # If upstream ever adds another workflow file, add a matching line
+        # here for it too - same pattern, different filename.
+        if: steps.check.outputs.need_build == 'true'
+        run: |
+          git checkout origin/main -- .github/workflows/arduino-build.yml 2>/dev/null || \
+            git rm -f .github/workflows/arduino-build.yml 2>/dev/null || true
+          git commit -m "Exclude upstream's CI workflow from this fork" || echo "No change to that file this run"
+
       - name: Set up Arduino CLI
         if: steps.check.outputs.need_build == 'true'
         uses: arduino/setup-arduino-cli@v2
