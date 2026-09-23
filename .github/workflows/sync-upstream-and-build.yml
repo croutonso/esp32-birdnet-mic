@@ -37,6 +37,11 @@ on:
 
 permissions:
   contents: write
+  workflows: write   # needed because merges sometimes touch upstream's own
+                      # .github/workflows/arduino-build.yml - without this,
+                      # GitHub rejects the push with "refusing to allow a
+                      # GitHub App to create or update workflow ... without
+                      # `workflows` permission"
 
 jobs:
   sync-and-build:
