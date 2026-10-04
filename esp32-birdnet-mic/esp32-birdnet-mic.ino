@@ -1,3 +1,4 @@
+#include "WifiAp.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <WiFiManager.h>
@@ -24,7 +25,7 @@
 #include "DiscoveryClient.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.24"
+#define FW_VERSION "1.25"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -533,6 +534,7 @@ static String bssidBytesToStr(const uint8_t b[6]) {
 }
 
 static void clearStoredBssidPin() {
+    if (wifiApPinned()) return;
     wifi_config_t cur;
     if (esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return;
     if (!cur.sta.bssid_set) return;
@@ -1936,10 +1938,10 @@ void checkWiFiHealth() {
         lastStatus = cur;
         initialized = true;
     }
-    if (cur != WL_CONNECTED) {
+    if (cur != WL_CONNECTED && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
-    } else if (lastStatus != WL_CONNECTED) {
+    } else if (cur == WL_CONNECTED && lastStatus != WL_CONNECTED) {
         wifiReconnectCount++;
         simplePrintln("WiFi reconnected: " + WiFi.localIP().toString() +
                       " (count " + String(wifiReconnectCount) + ")");
@@ -2234,6 +2236,7 @@ void scheduleReboot(bool factoryReset, uint32_t delayMs) {
 
 // Schedule a WiFi reconnect after delayMs, optionally pinning to a specific BSSID
 void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs) {
+    if (wifiApPinned()) bssid = wifiApPinned();
     if (bssid) {
         wifiReconnectHasBssid = true;
         memcpy(wifiReconnectBssid, bssid, 6);
@@ -2255,6 +2258,8 @@ uint32_t computeRecommendedMinRate() {
 // Restore application settings to safe defaults and persist
 void resetToDefaultSettings() {
     simplePrintln("FACTORY RESET: Restoring default settings...");
+    wifiApSave(nullptr);
+    clearStoredBssidPin();
 
     // Clear persisted settings in our namespace
     audioPrefs.begin("audio", false);
@@ -3292,16 +3297,31 @@ void setup() {
     // WiFi optimization for stable streaming
     WiFi.setSleep(false);
 
-    WiFiManager wm;
-    wm.setConnectTimeout(60);
-    wm.setConfigPortalTimeout(180);
-    if (!wm.autoConnect("ESP32-RTSP-Mic-AP")) {
-        simplePrintln("WiFi failed, restarting...");
-        ESP.restart();
+    wifiApLoad();
+    if (wifiApBeginPinned()) {
+        simplePrintln("WiFi: connecting to saved access point " + wifiApPinnedText());
+        unsigned long started = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - started < 15000UL) delay(50);
+        // Continue startup even while offline so the recovery web UI can run.
+    } else {
+        wifiApSave(nullptr);
+        WiFi.mode(WIFI_STA);
+        clearStoredBssidPin();
+        WiFiManager wm;
+        wm.setConnectTimeout(60);
+        wm.setConfigPortalTimeout(180);
+        if (!wm.autoConnect("ESP32-RTSP-Mic-AP")) {
+            simplePrintln("WiFi failed, restarting...");
+            ESP.restart();
+        }
     }
 
-    simplePrintln("WiFi connected: " + WiFi.localIP().toString());
-    logConnectedAp("initial");
+    if (WiFi.status() == WL_CONNECTED) {
+        simplePrintln("WiFi connected: " + WiFi.localIP().toString());
+        logConnectedAp("initial");
+    } else {
+        simplePrintln("Selected WiFi AP unavailable; recovery WiFi starts after 60 seconds offline.");
+    }
     clearStoredBssidPin();
 
     // Apply configured WiFi TX power after connect (logs once on change)
@@ -3395,6 +3415,7 @@ void setup() {
 
 void loop() {
     ArduinoOTA.handle();
+    wifiApRecoveryLoop();
 
     if (millis() - lastWebuiHandleMs >= WEBUI_HANDLE_INTERVAL_MS) {
         webui_handleClient();
@@ -3499,7 +3520,7 @@ void loop() {
         refreshLegacyRtspState();
         if (wasStreaming) mqttPublishState(true);
 
-        String ssid = WiFi.SSID();
+        String ssid = wifiApSsid();
         String pass = WiFi.psk();
         if (ssid.length() == 0) {
             simplePrintln("WiFi reconnect aborted: no stored SSID");

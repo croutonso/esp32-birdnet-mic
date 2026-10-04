@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.24** (2026-09-29; C6 OTA smoke test passed, extended validation pending)
+- Latest firmware: **v1.25** (2026-10-04; persistent Wi-Fi access-point selection)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
 - Recommended microphone: **Adafruit SPH0645LM4H** in selectable MSB / left-justified mode
@@ -43,6 +43,27 @@ rtsp://<device-hostname>.local:8554/audio2
 
 The API and Web UI publish `/audio1` and `/audio2`. Use `/audio1` in new configurations. `/audio`
 remains available only as a compatibility alias for stream 1.
+
+## Access point selection
+
+In **Time & Network → Access point**, leave **Automatic selection** enabled for the usual
+Wi-Fi behavior, or choose **Choose a specific access point**. Click **Find access points**, select
+one of the access points for your saved Wi-Fi network, then **Save and connect**. Results are
+ordered by signal strength (for example, -58 dBm is stronger than -75 dBm). The current connection
+can also be selected without scanning. Scanning may briefly affect streaming; changing the
+selection disconnects existing streams while Wi-Fi reconnects.
+
+The selected BSSID is saved across reconnects, restarts and OTA updates. The device does not
+fall back to another access point while locked. If the selected AP is unavailable for one minute,
+the device starts **ESP32-RTSP-Mic-AP**. Join that recovery Wi-Fi and open **http://192.168.4.1**
+to select **Automatic selection** or another AP. Recovery Wi-Fi closes after the device reconnects.
+This is a local recovery network without a Wi-Fi password, like the initial setup network.
+Reset Wi-Fi and factory reset also clear the saved AP selection.
+
+API: `GET /api/wifi/ap` returns the saved/current AP and connection status.
+`POST /api/wifi/ap` saves `bssid=AA:BB:CC:DD:EE:FF`; an empty `bssid=` restores automatic selection.
+`POST /api/wifi/scan` starts one asynchronous scan; poll `GET /api/wifi/scan` for same-SSID results.
+POST requests require the existing `X-ESP32MIC-CSRF: 1` header. Saving reconnects Wi-Fi.
 
 ## First Boot
 
