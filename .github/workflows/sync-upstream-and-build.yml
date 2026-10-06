@@ -125,18 +125,31 @@ jobs:
           done
           git commit -m "Exclude upstream's CI workflows from this fork" || echo "No workflow changes to exclude this run"
 
-      - name: Set up Arduino CLI
+      - name: Read upstream's pinned toolchain versions
+        # Upstream pins the Arduino CLI, ESP32 core and libraries in
+        # build-dependencies.json. This matters: the app partition on the
+        # device is only 1,310,720 bytes and the firmware is within ~1% of
+        # it, so an unpinned (newer) core can add several KB and push the
+        # build over the limit ("text section exceeds available space").
+        # Reading the versions from the merged tree means this follows any
+        # future upstream bump automatically - nothing to maintain here.
+        if: steps.check.outputs.need_build == 'true'
+        id: deps
+        run: |
+          echo "cli=$(python3 -c "import json;print(json.load(open('build-dependencies.json'))['arduino_cli'])")" >> "$GITHUB_OUTPUT"
+          cat build-dependencies.json
+
+      - name: Set up Arduino CLI (pinned version)
         if: steps.check.outputs.need_build == 'true'
         uses: arduino/setup-arduino-cli@v2
+        with:
+          version: ${{ steps.deps.outputs.cli }}
 
-      - name: Install ESP32 core and libraries
+      - name: Install pinned ESP32 core and libraries
+        # Upstream's own script: installs exactly what build-dependencies.json
+        # lists, then verifies the installed versions match.
         if: steps.check.outputs.need_build == 'true'
-        run: |
-          arduino-cli config init
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32
-          arduino-cli lib install WiFiManager
-          arduino-cli lib install PubSubClient
+        run: python3 tools/check_build_dependencies.py --install
 
       - name: Compile for XIAO ESP32-C6
         if: steps.check.outputs.need_build == 'true'
@@ -155,6 +168,8 @@ jobs:
         run: |
           cp esp32-birdnet-mic/build/esp32.esp32.XIAO_ESP32C6/esp32-birdnet-mic.ino.bin \
              firmware-app-c6.bin
+          SIZE=$(stat -c%s firmware-app-c6.bin)
+          echo "firmware-app-c6.bin: $SIZE bytes, headroom under 1310720 limit: $((1310720 - SIZE)) bytes"
 
       - name: Push merged source to your fork
         if: steps.check.outputs.need_build == 'true'
