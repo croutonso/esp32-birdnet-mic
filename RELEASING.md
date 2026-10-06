@@ -8,10 +8,10 @@ timeouts and write failures were all zero. This is a short device-side smoke tes
 Home Assistant entity inspection, controlled failure recovery and long-run
 streaming validation remain pending.
 
-## Prepared release notes
+## Release notes
 
-The community-facing release notes are in
-[release-notes/1.23.md](release-notes/1.23.md). Update the validation paragraph
+The current community-facing release notes are in
+[release-notes/1.24.md](release-notes/1.24.md). Update the validation paragraph
 with any subsequent test results.
 
 ## Build and local checks
@@ -37,16 +37,19 @@ using `esp32-birdnet-mic/tools/gen_webui_gzip_header.sh` before building.
 
 ## Publication acceptance check
 
-Publishing GitHub assets and deploying the public web/OTA feed are separate actions.
-Only perform each when authorized. A release is not complete until both agree.
-Both local publishing/deployment helpers finish with this acceptance check.
-The first action in a staged release can therefore report a mismatch until the
-second destination is updated; that means verification failed, not that the
-completed upload was rolled back. Do not repeat uploads blindly. After both
-actions, rerun the read-only check with the intended published version:
+After committing the reviewed release files, run `scripts/publish_release.sh`.
+The maintainer authorizes this complete workflow for requested firmware changes
+after validation, unless a task explicitly stops at review, testing, or preparation.
+The script pushes the GitHub commit and tag, publishes all four board asset sets,
+deploys the public web/OTA feed, and verifies that both destinations agree.
+The deployment helper checks the public web and performs the final acceptance
+check. If a step fails, inspect which destinations were already updated before
+retrying; uploads and deployments are not rolled back automatically.
+
+The read-only acceptance check can also be rerun independently:
 
 ```sh
-python3 tools/verify_published_release.py 1.23
+python3 tools/verify_published_release.py 1.24
 ```
 
 The check downloads public artifacts over the actual HTTP OTA route and compares all

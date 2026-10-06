@@ -10,6 +10,9 @@
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include "WebUI.h"
+#include "WifiAp.h"
+#include <algorithm>
+#include <vector>
 #include "WebUI_gz.h"
 
 // External variables and functions from main (.ino) – ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi
@@ -54,6 +57,7 @@ extern uint32_t computeRecommendedMinRate();
 extern bool scheduledResetEnabled;
 extern uint32_t resetIntervalHours;
 extern void scheduleReboot(bool factoryReset, uint32_t delayMs);
+extern volatile unsigned long wifiReconnectAt;
 extern void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
 extern uint16_t lastPeakAbs16;
 extern uint32_t audioClipCount;
@@ -135,6 +139,10 @@ extern const char* FW_OTA_ARTIFACT_STR;
 extern bool timeSynced;
 extern unsigned long lastTimeSyncSuccess;
 extern int32_t timeOffsetMinutes;
+extern uint8_t timeZoneMode;
+extern String customTimeZoneRule;
+extern bool isValidCustomTimeZoneRule(const String& rule);
+extern int32_t effectiveTimeOffsetMinutes();
 extern bool timeSyncEnabled;
 extern bool mdnsEnabled;
 extern bool mdnsRunning;
@@ -880,6 +888,9 @@ static void httpStatus() {
     json += "\"local_time\":\"" + jsonEscape(localTimeStr) + "\",";
     json += "\"utc_time\":\"" + jsonEscape(utcTimeStr) + "\",";
     json += "\"time_offset_min\":" + String(timeOffsetMinutes) + ",";
+    json += "\"effective_time_offset_min\":" + String(effectiveTimeOffsetMinutes()) + ",";
+    json += "\"time_zone_mode\":" + String((uint32_t)timeZoneMode) + ",";
+    json += "\"time_zone_rule\":\"" + jsonEscape(customTimeZoneRule) + "\",";
     json += "\"mdns_enabled\":" + String(mdnsEnabled?"true":"false") + ",";
     json += "\"mqtt_enabled\":" + String(mqttEnabled?"true":"false") + ",";
     json += "\"mqtt_connected\":" + String(mqttConnected?"true":"false") + ",";
@@ -1093,6 +1104,95 @@ static bool parseBssidStr(const String &s, uint8_t out[6]) {
     return true;
 }
 
+// On-demand asynchronous scan: polling never starts another scan.
+static bool wifiApScanRequested = false;
+static unsigned long wifiApScanStarted = 0;
+
+static void httpWifiApStatus() {
+    String json = "{\"ok\":true,\"ssid\":\"" + jsonEscape(wifiApSsid()) +
+        "\",\"locked_bssid\":\"" + wifiApPinnedText() +
+        "\",\"connected\":" + (WiFi.status() == WL_CONNECTED ? "true" : "false") +
+        ",\"bssid\":\"" + WiFi.BSSIDstr() + "\",\"rssi\":" + String(WiFi.RSSI()) +
+        ",\"recovery\":" + (wifiApRecoveryActive() ? "true" : "false") + "}";
+    apiSendJSON(json);
+}
+
+static void httpWifiApScanStart() {
+    if (!requireMutationAuth()) return;
+    if (wifiReconnectAt != 0 || WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"busy\"}"));
+        return;
+    }
+    String ssid = wifiApSsid();
+    if (!ssid.length()) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"no_ssid\"}"));
+        return;
+    }
+    WiFi.scanDelete();
+    int16_t result = WiFi.scanNetworks(true, true, false, 120, 0, ssid.c_str());
+    wifiApScanRequested = result == WIFI_SCAN_RUNNING || result >= 0;
+    wifiApScanStarted = millis();
+    apiSendJSON(wifiApScanRequested ? F("{\"ok\":true}") : F("{\"ok\":false,\"error\":\"scan_failed\"}"));
+}
+
+static void httpWifiApScanResults() {
+    if (!wifiApScanRequested || millis() - wifiApScanStarted > 30000UL) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"scan_expired\"}"));
+        return;
+    }
+    int16_t count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_RUNNING) {
+        apiSendJSON(F("{\"ok\":true,\"scanning\":true}"));
+        return;
+    }
+    if (count < 0) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"scan_failed\"}"));
+        return;
+    }
+    std::vector<int> matches;
+    String ssid = wifiApSsid();
+    for (int i = 0; i < count && i < 256; ++i) {
+        if (WiFi.SSID(i) == ssid) matches.push_back(i);
+    }
+    std::sort(matches.begin(), matches.end(), [](int a, int b) { return WiFi.RSSI(a) > WiFi.RSSI(b); });
+    String json = "{\"ok\":true,\"scanning\":false,\"aps\":[";
+    size_t limit = std::min(matches.size(), size_t(32));
+    for (size_t j = 0; j < limit; ++j) {
+        int i = matches[j];
+        if (j) json += ',';
+        json += "{\"bssid\":\"" + WiFi.BSSIDstr(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    }
+    json += "]}";
+    apiSendJSON(json);
+}
+
+static void httpWifiApSave() {
+    if (!requireMutationAuth()) return;
+    if (!web.hasArg("bssid")) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"missing_bssid\"}"));
+        return;
+    }
+    if (WiFi.scanComplete() == WIFI_SCAN_RUNNING || wifiReconnectAt != 0) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"busy\"}"));
+        return;
+    }
+    String value = web.arg("bssid");
+    value.trim();
+    uint8_t bssid[6] = {};
+    if (value.length() && (!parseBssidStr(value, bssid) || (bssid[0] & 1) ||
+        !(bssid[0] | bssid[1] | bssid[2] | bssid[3] | bssid[4] | bssid[5]))) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"bad_bssid\"}"));
+        return;
+    }
+    if (!wifiApSave(value.length() ? bssid : nullptr)) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"save_failed\"}"));
+        return;
+    }
+    webui_pushLog(value.length() ? F("WiFi AP selection saved: locked") : F("WiFi AP selection saved: automatic"));
+    scheduleWifiReconnect(wifiApPinned(), 500);
+    apiSendJSON(F("{\"ok\":true}"));
+}
+
 static void httpActionWifiReconnect(){
     if (!requireMutationAuth()) return;
 
@@ -1122,6 +1222,10 @@ static void httpActionNetworkReset(){
     if (!requireMutationAuth()) return;
 
     webui_pushLog(F("UI action: network_reset (clearing Wi-Fi and rebooting)"));
+    if (!wifiApSave(nullptr)) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"save_failed\"}"));
+        return;
+    }
     WiFiManager wm;
     wm.resetSettings();
     apiSendJSON(F("{\"ok\":true}"));
@@ -1351,6 +1455,28 @@ static void httpSet() {
         int32_t v;
         if (argToInt(v) && v >= -720 && v <= 840) { timeOffsetMinutes = v; configureTimeService(timeSyncEnabled); saveAudioSettings(); applied = true; }
     }
+    else if (key == "time_zone_mode") {
+        handled = true;
+        int32_t v;
+        if (argToInt(v) && v >= 0 && v <= 9 &&
+            (v != 9 || isValidCustomTimeZoneRule(customTimeZoneRule))) {
+            timeZoneMode = (uint8_t)v;
+            configureTimeService(timeSyncEnabled);
+            saveAudioSettings();
+            applied = true;
+        }
+    }
+    else if (key == "time_zone_rule") {
+        handled = true;
+        String v = web.arg("value");
+        if (!v.length() && timeZoneMode != 9) v = "UTC0";
+        if (isValidCustomTimeZoneRule(v) || (v == "UTC0" && timeZoneMode != 9)) {
+            customTimeZoneRule = v;
+            if (timeZoneMode == 9) configureTimeService(timeSyncEnabled);
+            saveAudioSettings();
+            applied = true;
+        }
+    }
     else if (key == "time_sync") {
         handled = true;
         String v = web.arg("value");
@@ -1577,6 +1703,10 @@ void webui_begin() {
     web.on("/api/action/server_stop", HTTP_POST, httpActionServerStop);
     web.on("/api/action/reset_i2s", HTTP_POST, httpActionResetI2S);
     web.on("/api/action/time_sync", HTTP_POST, httpActionTimeSync);
+    web.on("/api/wifi/ap", HTTP_GET, httpWifiApStatus);
+    web.on("/api/wifi/ap", HTTP_POST, httpWifiApSave);
+    web.on("/api/wifi/scan", HTTP_POST, httpWifiApScanStart);
+    web.on("/api/wifi/scan", HTTP_GET, httpWifiApScanResults);
     web.on("/api/action/wifi_reconnect", HTTP_POST, httpActionWifiReconnect);
     web.on("/api/action/network_reset", HTTP_POST, httpActionNetworkReset);
     web.on("/api/action/mqtt_discovery", HTTP_POST, httpActionMqttDiscovery);
@@ -1589,5 +1719,11 @@ void webui_begin() {
 }
 
 void webui_handleClient() {
+    // Release scan buffers even when the browser closes before collecting results.
+    if (wifiApScanRequested && millis() - wifiApScanStarted > 30000UL &&
+        WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+        WiFi.scanDelete();
+        wifiApScanRequested = false;
+    }
     web.handleClient();
 }

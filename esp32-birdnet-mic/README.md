@@ -8,11 +8,11 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.23** (2026-09-17; C6 OTA smoke test passed, extended validation pending)
+- Latest firmware: **v1.25** (2026-10-04; persistent Wi-Fi access-point selection)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
-- Microphones: **ICS-43434/INMP441** in default Philips I2S mode, or **Adafruit SPH0645LM4H** in
-  selectable MSB / left-justified mode
+- Recommended microphone: **Adafruit SPH0645LM4H** in selectable MSB / left-justified mode
+- Legacy microphones: **ICS-43434/INMP441** in default Philips I2S mode
 - User-facing overview and wiring: `../README.md`
 - Changelog: `CHANGELOG.md`
 - Web flasher: **https://esp32mic.msmeteo.cz**
@@ -43,6 +43,27 @@ rtsp://<device-hostname>.local:8554/audio2
 
 The API and Web UI publish `/audio1` and `/audio2`. Use `/audio1` in new configurations. `/audio`
 remains available only as a compatibility alias for stream 1.
+
+## Access point selection
+
+In **Time & Network → Access point**, leave **Automatic selection** enabled for the usual
+Wi-Fi behavior, or choose **Choose a specific access point**. Click **Find access points**, select
+one of the access points for your saved Wi-Fi network, then **Save and connect**. Results are
+ordered by signal strength (for example, -58 dBm is stronger than -75 dBm). The current connection
+can also be selected without scanning. Scanning may briefly affect streaming; changing the
+selection disconnects existing streams while Wi-Fi reconnects.
+
+The selected BSSID is saved across reconnects, restarts and OTA updates. The device does not
+fall back to another access point while locked. If the selected AP is unavailable for one minute,
+the device starts **ESP32-RTSP-Mic-AP**. Join that recovery Wi-Fi and open **http://192.168.4.1**
+to select **Automatic selection** or another AP. Recovery Wi-Fi closes after the device reconnects.
+This is a local recovery network without a Wi-Fi password, like the initial setup network.
+Reset Wi-Fi and factory reset also clear the saved AP selection.
+
+API: `GET /api/wifi/ap` returns the saved/current AP and connection status.
+`POST /api/wifi/ap` saves `bssid=AA:BB:CC:DD:EE:FF`; an empty `bssid=` restores automatic selection.
+`POST /api/wifi/scan` starts one asynchronous scan; poll `GET /api/wifi/scan` for same-SSID results.
+POST requests require the existing `X-ESP32MIC-CSRF: 1` header. Saving reconnects Wi-Fi.
 
 ## First Boot
 
@@ -188,8 +209,10 @@ Default hostname is unique per device, for example `esp32mic-a1b2c3`.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/connection-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="../assets/connection.png">
-  <img alt="Wiring diagram for the XIAO ESP32-C6 and ICS-43434 microphone" src="../assets/connection.png">
+  <img alt="Wiring diagram for a XIAO ESP32-C6 and I2S microphone; ICS-43434 module shown" src="../assets/connection.png">
 </picture>
+
+*ICS-43434 module shown; use the same connections for SPH0645LM4H and INMP441.*
 
 Use the same physical XIAO pin labels on every supported board. The underlying GPIO numbers differ
 by chip.
@@ -203,24 +226,20 @@ by chip.
 | **VDD** | 3V3 | - | - | - | - | Power |
 | **GND** | GND | - | - | - | - | Ground |
 
-The firmware configures I2S as master/RX, reads the left channel, then shifts/scales samples to
-16-bit PCM. Set `L/R` or `SEL` to the left channel, usually GND. The same physical wiring is used
-for ICS-43434, INMP441, and Adafruit SPH0645LM4H, but their sample alignment differs:
+Use the same physical wiring for all supported microphones and power them from **3.3 V**. Connect
+`L/R` or `SEL` to **GND** because the firmware reads the left channel. Then select the matching
+format:
 
-- **ICS-43434 / INMP441:** standard Philips I2S; firmware default.
-- **Adafruit SPH0645LM4H:** MSB / left-justified; select it in **Audio -> Microphone format** or set
+- **Adafruit SPH0645LM4H (recommended for new builds):** MSB / left-justified; select it in
+  **Audio -> Microphone format** or set
   API key `mic_format` to `1`.
+- **ICS-43434 / INMP441 (legacy):** standard Philips I2S; firmware default.
 
-Legacy INMP441 order codes received an EOL notice in 2018, while TDK currently marks both the
-INMP441 family and ICS-43434 as Production/NRND (not recommended for new designs). The SPH0645
-option therefore provides a currently available path for new builds. It
-was tested on contributor hardware and reported to behave like the existing microphones; the
-maintainer has not independently hardware-tested it yet.
+SPH0645 support was tested on contributor hardware. ICS-43434 and INMP441 remain supported for
+existing builds.
 
-Selecting the wrong UI format cannot electrically damage either microphone. The setting changes
-only the ESP32 I2S receiver's one-bit alignment (`bit_shift`); power, pin direction, BCLK/WS rates,
-and wiring remain unchanged. A mismatch produces incorrectly decoded audio. Supplying the wrong
-voltage or wiring a module incorrectly is a separate electrical risk; use 3.3 V only.
+The wrong format only produces incorrectly decoded audio; it does not change the wiring or damage
+the microphone. Incorrect wiring or 5 V power can still cause damage.
 
 Firmware v1.21 outputs MCLK at 256 times the configured sample rate. This allows experimental
 PCM1808 ADC hardware to run in slave I2S mode with its left input captured by the existing mono
@@ -274,7 +293,7 @@ The Web UI runs on port **80** and includes:
 - Audio: microphone format, sample rate, gain, buffer size, I2S shift, high-pass filter, signal level.
 - Audio API diagnostics: producer state, ring-buffer capacity/chunks/drops/flushes, I2S errors,
   and RTSP write stalls/timeouts.
-- Time & Network: NTP state, time offset, mDNS, stream schedule, optional deep sleep, Wi-Fi actions.
+- Time & Network: NTP state, microphone location/time zone, mDNS, stream schedule, optional deep sleep, Wi-Fi actions.
 - Reliability: auto-recovery, threshold mode, check interval, scheduled reset.
 - Thermal: current/peak temperature, shutdown limit, protection latch, acknowledgement.
 - MQTT & Home Assistant: broker settings, publish interval, discovery republish.
@@ -340,6 +359,12 @@ BirdNET-Go or BirdNET-Pi.
 - Hostname can be changed via API: `key=mdns_hostname&value=esp32mic-garden`.
 - mDNS often fails on isolated/guest Wi-Fi or inside Docker containers; use device IP in those cases.
 - NTP sync runs on boot, retries every hour until synced, then refreshes every 6 hours.
+- Time zone can use a manual UTC offset (including 15-minute increments), automatic presets for Central Europe, New Zealand mainland, UK, US daylight-saving zones, and Sydney/Melbourne, or a custom POSIX daylight-saving rule. Existing settings stay on manual offset after an update.
+- In the Web UI, choose the microphone's location. The manual UTC offset or advanced custom rule appears only when that option is selected.
+- NTP sets the clock; the selected time zone controls local timestamps and schedule windows. The API uses `time_zone_mode=0..9`, `time_zone_rule=<POSIX rule>` for mode 9, and reports `effective_time_offset_min`. For example, US Eastern is `EST5EDT,M3.2.0/2,M11.1.0/2`.
+- Save a valid custom rule before selecting mode 9. Custom rules use recurring `Mmonth.week.weekday` start/end dates.
+- After leaving mode 9, clearing the custom rule field restores the default `UTC0` value.
+- POSIX rules cover recurring annual transitions. Some regions have irregular or changing rules; check the displayed local time after selection and update the rule if local law changes.
 - If time is unavailable, logs fall back to uptime timestamps.
 
 ### Stream Schedule And Deep Sleep
@@ -350,6 +375,7 @@ Stream schedule is configured in Time & Network.
 - If time is invalid, schedule policy is fail-open: streaming stays allowed.
 - If start and stop are equal, the window is explicitly empty and streaming is blocked.
 - Optional deep sleep can run outside the stream window only when time is valid.
+- Deep-sleep wake timing uses the next local schedule start across daylight-saving changes; the clock may still need NTP after waking.
 - Deep sleep is blocked during startup grace, with active clients, or without valid time.
 
 API keys:
@@ -519,6 +545,10 @@ wifiTxDbm        Wi-Fi TX power
 mdnsEn           mDNS enable
 timeSyncEn       NTP enable
 timeOffset       Local offset in minutes
+timeZone         0 = fixed offset, 1 = Central Europe, 2 = New Zealand,
+                 3 = UK, 4..7 = US Eastern/Central/Mountain/Pacific,
+                 8 = Australia Eastern, 9 = custom POSIX rule
+timeZoneRule     Custom POSIX daylight-saving rule (mode 9)
 strSchedEn       Stream schedule enable
 strSchStart      Stream window start minute
 strSchStop       Stream window stop minute
@@ -571,8 +601,8 @@ Current validation ranges include `sampleRate=8000..192000`, `bufferSize=256..81
 - No TLS or built-in user authentication for the Web UI/API.
 - mDNS depends on multicast support in your LAN and often does not work across VLANs, guest networks, or Docker bridge networks.
 - The firmware is primarily runtime-tested on Seeed Studio XIAO ESP32-C6 with ICS-43434; C3/S3/C5
-  builds are compile-verified in Arduino ESP32 core 3.3.8. SPH0645 support is contributor-tested but
-  has not been independently verified by the maintainer on physical hardware.
+  builds are compile-verified in Arduino ESP32 core 3.3.8. SPH0645 support was tested on contributor
+  hardware.
 
 ## Credits
 
