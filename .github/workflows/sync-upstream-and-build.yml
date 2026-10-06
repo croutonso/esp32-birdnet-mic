@@ -79,36 +79,51 @@ jobs:
           fi
 
       - name: Merge the new release into your branch
+        # If the merge conflicts ONLY in .github/workflows/ files, resolve
+        # those automatically by keeping your versions - you never want
+        # upstream's CI files here (GITHUB_TOKEN can't push them anyway).
+        # If anything ELSE conflicts (e.g. your pin lines in the .ino),
+        # fail loudly so you can resolve it by hand instead of building
+        # something wrong.
         if: steps.check.outputs.need_build == 'true'
         run: |
-          git merge --no-edit "${{ steps.latest.outputs.tag }}" || {
-            echo "::error::Merge conflict pulling ${{ steps.latest.outputs.tag }}. Resolve locally (see file header for the commands), push, then re-run this workflow."
-            exit 1
-          }
+          if ! git merge --no-edit "${{ steps.latest.outputs.tag }}"; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files:"
+            echo "$CONFLICTS"
+            OTHER=$(echo "$CONFLICTS" | grep -v '^\.github/workflows/' || true)
+            if [ -n "$CONFLICTS" ] && [ -z "$OTHER" ]; then
+              echo "Only workflow files conflicted - keeping your versions."
+              echo "$CONFLICTS" | while read -r f; do
+                git checkout --ours -- "$f"
+                git add -- "$f"
+              done
+              git commit --no-edit
+            else
+              echo "::error::Merge conflict in a real source file pulling ${{ steps.latest.outputs.tag }}. Resolve locally: git fetch upstream --tags && git merge ${{ steps.latest.outputs.tag }}, fix the conflict (check your I2S pin lines), push, then re-run this workflow."
+              exit 1
+            fi
+          fi
 
-      - name: Keep upstream's own CI workflow out of the pushed commit
+      - name: Keep upstream's own CI workflows out of the pushed commit
         # GITHUB_TOKEN can never be granted write access to .github/workflows/
-        # files - there's no permission key that turns this on, it's a fixed
-        # GitHub security boundary. Upstream has its own CI file at
-        # .github/workflows/arduino-build.yml; the merge above brings in
-        # whatever changes they made to it, but you don't run that workflow
-        # here, so just put it back to what's already live on your repo
-        # (origin/main, fetched by the checkout step above) and push only
-        # your actual source changes.
-        #
-        # Using origin/main here rather than HEAD^1 matters: HEAD^1 only
-        # means "state before the merge" if the merge actually produced a
-        # two-parent commit. If it ever fast-forwards instead, HEAD^1 means
-        # something else entirely and this step would silently do nothing -
-        # origin/main is correct regardless of how the merge landed.
-        #
-        # If upstream ever adds another workflow file, add a matching line
-        # here for it too - same pattern, different filename.
+        # files - there is no permission key that turns this on. So after the
+        # merge, put EVERY file under .github/workflows/ back to what is
+        # already live on your repo (origin/main): files upstream changed get
+        # reverted, files upstream newly added get removed. Handles any
+        # workflow file upstream has now or adds later - no filenames to
+        # maintain. origin/main is used as the baseline (not HEAD^1) because
+        # it is correct no matter how the merge landed.
         if: steps.check.outputs.need_build == 'true'
         run: |
-          git checkout origin/main -- .github/workflows/arduino-build.yml 2>/dev/null || \
-            git rm -f .github/workflows/arduino-build.yml 2>/dev/null || true
-          git commit -m "Exclude upstream's CI workflow from this fork" || echo "No change to that file this run"
+          for f in $(git diff --name-only origin/main HEAD -- .github/workflows/); do
+            if git cat-file -e "origin/main:$f" 2>/dev/null; then
+              git checkout origin/main -- "$f"
+            else
+              git rm -f -- "$f"
+            fi
+          done
+          git commit -m "Exclude upstream's CI workflows from this fork" || echo "No workflow changes to exclude this run"
 
       - name: Set up Arduino CLI
         if: steps.check.outputs.need_build == 'true'
