@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.34 - 2026-10-22
+
+- **C5 PSRAM:** enable PSRAM automatically in the build helper; allocate the 64 KiB RTSP ring and 32 KiB browser-listening queue in PSRAM. Keep DMA, PDM and capture/RTP working buffers internal. Preserve the adaptive internal-RAM fallback and check internal Wi-Fi/producer headroom before starting capture.
+- **Audio buffer lifecycle:** pair capability-aware allocation/deletion, clean up on task-start failure and prevent replacing listening storage after use or repeated initialization.
+- **Sense:** allow external Philips I2S and MSB/left-justified microphones while retaining the Sense board profile. PDM uses its built-in microphone. Preserve the chosen format across reboot/OTA, with existing transactional rollback on restart failure.
+- **AtomS3U:** record contributor hardware confirmation with BirdNET-Go on v1.33; keep its working CLK/DATA pins and left PDM slot. Sense remains experimental; maintainer hardware validation of both boards is pending.
+- **Diagnostics:** expose RTSP buffer placement and listening queue size, plus C5 PSRAM size/free space and the true minimum internal heap.
+- All four builds, a C5 PSRAM-disabled build and 59 host regression tests passed. C6 I2S OTA, TCP/UDP reception and browser listening passed with checked settings retained. See the [validation record](../release-notes/1.34-validation.md) for evidence and hardware limits.
+
+
+## 1.33 - 2026-10-21
+
+- **Manual recovery:** after explicitly switching thermal protection OFF, acknowledge a saved shutdown immediately, including emergency/repeated trips and sensor faults. Switching OFF alone keeps streaming paused until acknowledgement. With protection ON, the five-minute cooling requirement still applies.
+
+- **OTA:** stop RTSP/browser listeners, audio capture and I2S/PDM clocks before flash writes on automatic download, manual upload and ArduinoOTA. Keep capture paused until reboot after success; restore it after failure without bypassing a thermal shutdown or stream schedule.
+- **Thermal shutdown:** stop capture and its clocks so the module can cool, including after reboot with a saved shutdown. Restart capture successfully before clearing the latch or restoring RTSP.
+- **Temperature monitoring:** use checked ESP-IDF sensor reads and supported measurement ranges instead of Arduino's fixed 10–50 °C configuration. Failed reads never become valid samples even when the driver supplies a finite number.
+- **Cooling recovery:** require five continuous minutes at least **10 °C below the shutdown limit**, reduced from 15 °C. Migrate saved shutdowns to the new margin once, preserving trip history, emergency/manual blocks and existing user settings. Invalid/missing samples reset the cooling timer.
+- All four builds and 55 regression tests passed. C6 I2S OTA, thermal shutdown, immediate manual acknowledgement in the real Web UI and RTSP reception passed with settings retained. Sensor-failure and cooling boundary cases were simulated; see the [validation record](../release-notes/1.33-validation.md) for coverage and hardware limits.
+
+## 1.32 - 2026-10-21
+
+- Add **Audio → S3 board** to the shared S3 firmware. XIAO ESP32-S3 with an external microphone remains the default; select XIAO ESP32-S3 Sense or M5Stack AtomS3U for their built-in 48 kHz PDM microphones. Both are **Experimental — needs more testing**.
+- Save board selection across restarts and OTA updates; restore the previous audio configuration if switching fails.
+
+## 1.31 - 2026-10-20
+
+### Highlights
+
+- **Recommended microphone settings:** review board-specific values before saving, keep saved settings or cancel. Apply a profile later with **Recommended settings**.
+- **Clearer save feedback:** Unsaved indicators clear when values return to their saved state, including equivalent numeric input such as 1.50 and 1.5. Newer edits survive status polling and pending/failed saves.
+- **C5 audio startup fix:** reduce the browser-listening queue from 16 KiB to 4 KiB, freeing 12 KiB for capture and Wi-Fi/TCP. A bounded fallback allows the minimum capture reserve with 64 KiB Wi-Fi headroom when the normal 80 KiB allowance cannot fit. Applies to I2S and PDM startup/reconfiguration.
+- **Optional 240 MHz CPU setting on S3/C5**, with board-aware save/boot validation. C3/C6 remain limited to 160 MHz; defaults remain 160 MHz.
+- **Clearer hardware guide:** separate ESP32 boards, microphones and accessories; recommend SPH0645LM4H for I2S and identify IM73D122 as **Best quality** by its specified microphone SNR. Add contributor-reported Adafruit PDM / MP34DT01 alternatives and their wiring labels. PDM remains experimental.
+- Remove the unused old Web UI screenshot and superseded versioned firmware copies from the current tree. Current board images and legacy OTA recovery routes are retained.
+
+### Audio settings
+
+- Apply microphone and recommended values in one capture restart; restore audio/CPU settings on failure and save only on success. Recommendations are optional and never replace settings automatically on update or boot.
+- PDM recommendations start at 48 kHz, Gain 24, 512-sample packets and 160 MHz for software conversion. Check actual levels and clipping for the microphone and location. I2S Shift is unused in PDM mode.
+- When upgrading from the contributor's v15 PDM firmware, start with **new Gain = old Gain × 2^(16 − old Shift)**. Example: Shift 12 / Gain 1.5 becomes Gain 24. Existing Gain settings are preserved.
+- Slow browser listeners disconnect without blocking RTSP. Other boards retain the 16 KiB browser queue. Memory checks retain producer-stack, allocation-overhead and contiguous-block requirements.
+
+### Validation
+
+All four board builds, 48 regression tests and source/embedded browser checks pass. Final C6 I2S OTA retained all 32 checked settings and served the exact packaged UI. Concurrent 48 kHz browser audio and a 15-second RTSP/TCP reception passed without new capture, DMA, buffer or write errors. Physical PDM validation and long-running C5 PDM testing of this integrated firmware remain pending.
+
 ## 1.30 - 2026-10-19
 
 ### Highlights

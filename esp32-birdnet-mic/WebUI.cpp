@@ -14,6 +14,10 @@
 #include "AudioDiagnostics.h"
 #include "MicrophoneSignal.h"
 #include "BrowserAudio.h"
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && CONFIG_SPIRAM
+#include <esp_heap_caps.h>
+#endif
+#include "MicrophoneProfiles.h"
 #include "WifiAp.h"
 #include "ThermalRecovery.h"
 #include <algorithm>
@@ -46,6 +50,7 @@ extern uint32_t audioRingBufferFlushCount;
 extern uint32_t rtspWriteStallCount;
 extern uint32_t rtspWriteTimeoutCount;
 extern size_t audioRingBufferCapacityBytes;
+extern bool audioRingInPsram;
 extern volatile bool audioProducerRunning;
 extern volatile bool audioProducerStopRequested;
 extern volatile uint32_t audioProducerLastReadMs;
@@ -94,6 +99,8 @@ extern bool overheatAutoResumeEnabled;
 extern ThermalRecovery thermalRecovery;
 extern bool acknowledgeThermalShutdown();
 extern void cancelThermalResume();
+extern void beginOtaUpdate();
+extern void endOtaUpdate(bool installed);
 struct StreamProfileConfig { uint8_t target; };
 extern StreamProfileConfig streamProfiles[2];
 extern bool streamEnabled[2];
@@ -148,6 +155,14 @@ extern String formatSince(unsigned long eventMs);
 extern bool restartI2S();
 extern bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8_t newShift);
 extern bool applyMicFormatConfig(uint8_t newFormat);
+extern bool applyMicProfileConfig(uint8_t newFormat, bool recommended);
+extern uint8_t s3BoardVariant;
+extern bool s3BoardSelectionSupported();
+extern bool builtinMicSelected();
+extern bool applyS3BoardConfig(uint8_t variant);
+extern bool getRecommendedMicSettings(uint8_t format, micprofiles::Settings& out);
+extern bool cpuFrequencySupported(uint32_t mhz);
+extern uint16_t maxSupportedCpuFrequencyMhz();
 extern uint16_t maxHighpassCutoffForRate(uint32_t sampleRate);
 extern void saveAudioSettings();
 extern void applyWifiTxPower(bool log);
@@ -704,10 +719,11 @@ static bool installOtaFromUrl(const String &url, String &errorOut) {
         return false;
     }
 
-    stopAllRtspClients("OTA update starting");
+    beginOtaUpdate();
     webui_pushLog(String("OTA pull update from ") + url);
     bool ok = streamUpdate(*stream, contentLength, errorOut);
     http.end();
+    endOtaUpdate(ok);
     return ok;
 }
 
@@ -799,6 +815,7 @@ static void httpOtaUploadDone() {
         sendOtaPage(F("Firmware uploaded and installed. Device will reboot now."), true);
         scheduleReboot(false, 700);
     } else {
+        endOtaUpdate(false);
         sendOtaPage(String("Upload failed: ") + otaUploadError, false);
     }
 }
@@ -818,16 +835,18 @@ static void httpOtaUploadChunk() {
             Update.abort();
             return;
         }
-        stopAllRtspClients("OTA upload starting");
+        beginOtaUpdate();
         webui_pushLog(String("OTA upload start: ") + upload.filename);
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             otaUploadError = String("Update begin failed: ") + Update.errorString();
+            endOtaUpdate(false);
         }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (otaUploadError.length() == 0) {
             if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
                 otaUploadError = String("Flash write failed: ") + Update.errorString();
                 Update.abort();
+                endOtaUpdate(false);
             }
         }
     } else if (upload.status == UPLOAD_FILE_END) {
@@ -843,9 +862,11 @@ static void httpOtaUploadChunk() {
                 webui_pushLog(String("OTA upload installed, bytes=") + String(upload.totalSize));
             }
         }
+        endOtaUpdate(otaUploadOk);
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
         otaUploadError = F("Upload aborted.");
         Update.abort();
+        endOtaUpdate(false);
     }
 }
 
@@ -893,6 +914,12 @@ static void httpStatus() {
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
     json += "\"free_heap_kb\":" + String(freeHeap/1024) + ",";
     json += "\"min_free_heap_kb\":" + String(minFreeHeap/1024) + ",";
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && CONFIG_SPIRAM
+    const uint32_t internalCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    json += "\"internal_heap_min_kb\":" + String((uint32_t)(heap_caps_get_minimum_free_size(internalCaps)/1024)) + ",";
+    json += "\"psram_total_kb\":" + String(ESP.getPsramSize()/1024) + ",";
+    json += "\"psram_free_kb\":" + String(ESP.getFreePsram()/1024) + ",";
+#endif
     json += "\"uptime\":\"" + uptimeStr + "\",";
     json += "\"time_synced\":" + String(timeSynced?"true":"false") + ",";
     json += "\"time_sync_enabled\":" + String(timeSyncEnabled?"true":"false") + ",";
@@ -967,6 +994,9 @@ static void httpAudioStatus() {
     json += "\"audio_dsp\":\"integer\",";
     json += "\"i2s_shift\":" + String(i2sShiftBits) + ",";
     json += "\"mic_format\":" + String(micFormat) + ",";
+    json += "\"s3_board_supported\":" + String(s3BoardSelectionSupported() ? "true" : "false") + ",";
+    json += "\"s3_board\":" + String(s3BoardVariant) + ",";
+    json += "\"builtin_mic\":" + String(builtinMicSelected() ? "true" : "false") + ",";
     json += "\"pdm_supported\":" + String(pdmMicSupported() ? "true" : "false") + ",";
     json += "\"pdm_decoder\":\"" + String(pdmDecoderName()) + "\",";
     json += "\"pdm_clock_hz\":" + String(micFormat == 2 ? 3072000 : 0) + ",";
@@ -993,6 +1023,8 @@ static void httpAudioStatus() {
     json += "\"browser_listening\":" + String(browserAudioActive() ? "true" : "false") + ",";
     json += "\"i2s_error_count\":" + String(audioI2SErrorCount) + ",";
     json += "\"rb_capacity_bytes\":" + String((uint32_t)audioRingBufferCapacityBytes) + ",";
+    json += "\"rb_in_psram\":" + String(audioRingInPsram ? "true" : "false") + ",";
+    json += "\"listen_queue_bytes\":" + String((uint32_t)browserAudioQueueBytes()) + ",";
     json += "\"rb_chunks\":" + String(audioRingBufferChunkCount) + ",";
     json += "\"rb_drops\":" + String(audioRingBufferDropCount.load(std::memory_order_relaxed)) + ",";
     json += "\"rb_flushes\":" + String(audioRingBufferFlushCount) + ",";
@@ -1039,6 +1071,7 @@ static void httpThermal() {
     json += "\"current_valid\":" + String(lastTemperatureValid?"true":"false") + ",";
     json += "\"max_c\":" + String(maxTemperature,1) + ",";
     json += "\"cpu_mhz\":" + String(getCpuFrequencyMhz()) + ",";
+    json += "\"cpu_max_mhz\":" + String(maxSupportedCpuFrequencyMhz()) + ",";
     json += "\"protection_enabled\":" + String(overheatProtectionEnabled?"true":"false") + ",";
     json += "\"shutdown_c\":" + String(overheatShutdownC,0) + ",";
     json += "\"latched\":" + String(overheatLockoutActive?"true":"false") + ",";
@@ -1057,7 +1090,7 @@ static void httpThermal() {
     json += "\"trips_24h\":" + String(thermalRecovery.state.count) + ",";
     json += "\"cool_limit_c\":" + String(overheatLatched ? thermalRecovery.state.coolLimitC : overheatShutdownC - ThermalRecovery::COOL_MARGIN_C, 1) + ",";
     json += "\"cool_remaining_sec\":" + String(thermalRecovery.remainingSec(millis())) + ",";
-    json += "\"can_acknowledge\":" + String((thermalRecovery.state.notice && (!overheatLatched || thermalRecovery.cooled(millis())))?"true":"false") + ",";
+    json += "\"can_acknowledge\":" + String((thermalRecovery.state.notice && thermalRecovery.canAcknowledge(millis(), overheatProtectionEnabled))?"true":"false") + ",";
     json += "\"schedule_allowed\":" + String(isStreamScheduleAllowedNow(nullptr)?"true":"false") + ",";
     json += "\"manual_restart\":" + String(manualRequired?"true":"false");
     json += "}";
@@ -1384,6 +1417,58 @@ static bool applyAndSaveMicFormat(uint8_t newFormat) {
     return false;
 }
 
+static void httpMicProfile() {
+    uint32_t format;
+    micprofiles::Settings profile;
+    if (!parseUInt32Strict(web.arg("format"), format) || format > 2 ||
+        !getRecommendedMicSettings(uint8_t(format), profile) ||
+        (format == 2 && !pdmMicSupported())) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"invalid_value\"}"));
+        return;
+    }
+    String json;
+    json.reserve(480);
+    json = "{\"ok\":true,\"board\":\"" + jsonEscape(String(FW_BOARD_NAME_STR)) +
+        "\",\"mic_format\":" + String(format) + ",\"current_format\":" + String(micFormat) +
+        ",\"sample_rate\":" + String(profile.rate) + ",\"gain\":" + String(profile.gain, 2) +
+        ",\"buffer_size\":" + String(profile.buffer) + ",\"i2s_shift\":" + String(profile.shift) +
+        ",\"hp_enable\":" + String(profile.highpass ? "true" : "false") +
+        ",\"hp_cutoff_hz\":" + String(profile.cutoff) + ",\"cpu_mhz\":" + String(profile.cpu) + "}";
+    apiSendJSON(json);
+}
+
+static void httpSaveMicProfile() {
+    if (!requireMutationAuth()) return;
+    uint32_t format;
+    const String mode = web.arg("settings");
+    if (!parseUInt32Strict(web.arg("format"), format) || format > 2 ||
+        (mode != "recommended" && mode != "keep")) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"invalid_value\"}"));
+        return;
+    }
+    if (!applyMicProfileConfig(uint8_t(format), mode == "recommended")) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"i2s_restart_failed\"}"));
+        return;
+    }
+    saveAudioSettings();
+    apiSendJSON(F("{\"ok\":true}"));
+}
+
+static void httpSaveS3Board() {
+    if (!requireMutationAuth()) return;
+    uint32_t variant;
+    if (!s3BoardSelectionSupported() || !parseUInt32Strict(web.arg("variant"), variant) || variant > 2) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"invalid_value\"}"));
+        return;
+    }
+    if (!applyS3BoardConfig(uint8_t(variant))) {
+        apiSendJSON(F("{\"ok\":false,\"error\":\"i2s_restart_failed\"}"));
+        return;
+    }
+    saveAudioSettings();
+    apiSendJSON(F("{\"ok\":true}"));
+}
+
 // Validate the whole group before changing runtime state or writing preferences.
 static void httpSaveSchedule() {
     if (!requireMutationAuth()) return;
@@ -1521,7 +1606,11 @@ static void httpSet() {
     else if (key == "cpu_freq") {
         handled = true;
         uint32_t v;
-        if (argToUInt(v) && (v == 40 || v == 80 || v == 160)) { cpuFrequencyMhz = (uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); applied = true; }
+        if (argToUInt(v) && cpuFrequencySupported(v) && setCpuFrequencyMhz(v)) {
+            cpuFrequencyMhz = (uint8_t)v;
+            saveAudioSettings();
+            applied = true;
+        }
     }
     else if (key == "hp_enable") {
         handled = true;
@@ -1536,7 +1625,7 @@ static void httpSet() {
     else if (key == "oh_enable") {
         handled = true;
         String v = web.arg("value");
-        if (v == "on" || v == "off") { overheatProtectionEnabled = (v == "on"); overheatConsecutiveSamples = 0; thermalRecovery.resetCooling(); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); applied = true; }
+        if (v == "on" || v == "off") { overheatProtectionEnabled = (v == "on"); overheatConsecutiveSamples = 0; thermalRecovery.resetCooling(); overheatLockoutActive = overheatLatched; saveAudioSettings(); applied = true; }
     }
     else if (key == "oh_auto") {
         handled = true;
@@ -1799,6 +1888,7 @@ void webui_begin() {
     web.on("/api/ota_status", HTTP_GET, httpOtaStatus);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
+    web.on("/api/microphone_profile", HTTP_GET, httpMicProfile);
     web.on("/api/perf_status", httpPerfStatus);
     web.on("/api/thermal", httpThermal);
     web.on("/api/thermal/clear", HTTP_POST, httpThermalClear);
@@ -1817,6 +1907,8 @@ void webui_begin() {
     web.on("/api/action/reboot", HTTP_POST, httpActionReboot);
     web.on("/api/action/factory_reset", HTTP_POST, httpActionFactoryReset);
     web.on("/api/set", HTTP_POST, httpSet);
+    web.on("/api/settings/microphone", HTTP_POST, httpSaveMicProfile);
+    web.on("/api/settings/s3_board", HTTP_POST, httpSaveS3Board);
     web.on("/api/settings/schedule", HTTP_POST, httpSaveSchedule);
     web.on("/api/settings/mqtt", HTTP_POST, httpSaveMqtt);
     static const char* headerKeys[] = { UI_MUTATION_HEADER };

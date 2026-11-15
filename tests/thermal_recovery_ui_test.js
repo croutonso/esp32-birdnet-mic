@@ -3,12 +3,15 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, '../esp32-birdnet-mic/webui/index.html'), 'utf8');
+assert(html.includes('Recovery requires 5 minutes at least 10 C below the limit.'));
+assert(!html.includes('at least 15 C below the limit'));
 const ids = ['sel_oh_auto', 'therm_trip_count', 'thermal_notice', 'thermal_notice_title',
   'thermal_notice_detail', 'row_therm_latch', 'txt_therm_latch', 'therm_status',
   'btn_therm_clear', 'btn_thermal_notice_ack', 'b_srv_on', 'b_srv_off'];
 const nodes = Object.fromEntries(ids.map(id => [id, {style: {}, classList: {toggle() {}}}]));
-const context = vm.createContext({$: id => nodes[id] || null, Date, locks: {}, edits: {},
+const context = vm.createContext({$: id => nodes[id] || null, Date, locks: {}, edits: {}, confirmedValues: {}, dirtyEls: {oh_auto:[nodes.sel_oh_auto]}, savingKeys: new Set(), pendingSyncKeys: new Set(),
   toggleDirty() {}, thermalAutoPending: false});
+vm.runInContext(html.slice(html.indexOf('function fieldValue('),html.indexOf('function trackEdit('))+html.slice(html.indexOf('function clearDirty('),html.indexOf('function toggleDirty(')),context);
 function loadFunction(name, next) {
   const start = html.indexOf('function ' + name + '(');
   const end = html.indexOf('function ' + next + '(', start);
@@ -18,14 +21,14 @@ function loadFunction(name, next) {
 loadFunction('renderThermalRecovery', 'loadTherm');
 loadFunction('setToggleState', 'renderTimeRows');
 const state = {protection_enabled: true, auto_resume_enabled: true, auto_resume_pending: true,
-  latched_persist: true, notice: true, trips_24h: 1, cool_limit_c: 65, cool_remaining_sec: 300,
+  latched_persist: true, notice: true, trips_24h: 1, cool_limit_c: 70, cool_remaining_sec: 300,
   can_acknowledge: false, schedule_allowed: true, last_trip_c: 81};
 context.renderThermalRecovery(state);
 assert.equal(nodes.thermal_notice.style.display, '');
 assert.equal(nodes.btn_therm_clear.disabled, true);
 assert.equal(nodes.btn_thermal_notice_ack.disabled, true);
 assert.equal(nodes.therm_trip_count.textContent, '1 / 3');
-assert(nodes.thermal_notice_detail.textContent.includes('65 °C'));
+assert(nodes.thermal_notice_detail.textContent.includes('70 °C'));
 assert(nodes.thermal_notice_detail.textContent.includes('5:00'));
 context.setToggleState(false);
 assert.equal(nodes.b_srv_off.disabled, false); // User can cancel pending recovery.
@@ -39,6 +42,15 @@ assert(nodes.thermal_notice_detail.textContent.includes('sensor unavailable'));
 assert.equal(nodes.btn_therm_clear.disabled, true);
 context.renderThermalRecovery({...state, emergency: true, auto_resume_pending: false});
 assert(nodes.thermal_notice_title.textContent.includes('Emergency'));
+context.renderThermalRecovery({...state, protection_enabled:false, sensor_fault:true,
+  emergency:true, auto_resume_pending:false, can_acknowledge:true});
+assert.equal(nodes.btn_therm_clear.disabled,false);
+assert.equal(nodes.btn_thermal_notice_ack.disabled,false);
+assert.equal(nodes.therm_status.textContent,'Protection disabled');
+assert(nodes.thermal_notice_detail.textContent.includes('without waiting for cooling'));
+assert(!nodes.thermal_notice_detail.textContent.includes('Recovery remains blocked'));
+context.renderThermalRecovery({...state, sensor_fault:true, can_acknowledge:false});
+assert.equal(nodes.btn_therm_clear.disabled,true);
 context.renderThermalRecovery({...state, schedule_allowed: false});
 assert(nodes.thermal_notice_detail.textContent.includes('outside the allowed schedule'));
 context.renderThermalRecovery({...state, latched_persist: false, auto_resume_pending: false,

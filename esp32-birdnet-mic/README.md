@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S and experimental PDM microphones that 
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.30** (2026-10-19)
+- Latest firmware: **v1.34** (2026-10-22)
 - [Overview, support status and parts](../README.md) · [Release history](CHANGELOG.md)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
@@ -19,6 +19,39 @@ and Home Assistant MQTT Discovery.
 - Web flasher: **https://esp32mic.msmeteo.cz**
 - Manual OTA firmware: `../manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
 - License: MIT (`../LICENSE`)
+
+## S3 board selection (since v1.32)
+
+**XIAO ESP32-S3 Sense and M5Stack AtomS3U** use the shared **S3 firmware**.
+AtomS3U was contributor-tested with BirdNET-Go on v1.33; Sense remains
+**Experimental — needs more testing**. Maintainer hardware validation is pending. Open **Audio → S3 board** in the device Web UI,
+select the board, and click **Apply board**. Its built-in PDM microphone runs at
+48 kHz; the selection is saved across restarts and OTA updates. Adjust Gain using
+the signal meter and Listen.
+
+The **XIAO ESP32-S3 / Plus (default)** option keeps the usual wiring
+and microphone-format selection. The selector is shown only in S3 firmware.
+The Sense profile also accepts external I2S microphones using the normal S3 wiring.
+PDM in that profile uses the built-in microphone. For an external PDM microphone,
+use the default board option.
+
+## C5 PSRAM audio buffers (v1.34)
+
+The build helper enables C5 PSRAM by default. The RTSP reserve uses 64 KiB and
+browser listening uses 32 KiB of PSRAM. DMA, PDM filter and capture/RTP working
+buffers stay in internal RAM. If PSRAM is disabled, unavailable or an allocation
+fails, the existing adaptive internal reserve and 4 KiB listening queue remain
+available. Internal Wi-Fi and producer-stack headroom is checked before capture.
+
+`/api/audio_status` reports `rb_in_psram`, `rb_capacity_bytes` and
+`listen_queue_bytes`. C5 PSRAM builds also expose `internal_heap_min_kb`,
+`psram_total_kb` and `psram_free_kb` in `/api/status`. The true internal-heap
+minimum captures brief memory dips that the sampled UI minimum can miss.
+
+Contributor testing of the patch on v1.33 ran for 9.2 hours with C5/IM73D122,
+with 0.09% ring drops and no DMA overruns or I2S errors. Internal heap briefly
+reached 11 KiB; this is useful hardware evidence, not a guarantee for every
+network or the final v1.34 integration. Maintainer C5 hardware validation is pending.
 
 ## Important URLs
 
@@ -76,6 +109,13 @@ POST requests require the existing `X-ESP32MIC-CSRF: 1` header. Saving reconnect
 
 Default hostname is unique per device, for example `esp32mic-a1b2c3`.
 
+## What's new in 1.31
+
+C5 frees 12 KiB of static RAM by using a 4 KiB browser-listening queue. Audio startup
+and reconfiguration can use the minimum capture reserve with a bounded 64 KiB Wi-Fi
+allowance when the normal 80 KiB allowance cannot fit. This fixes the reported C5
+boot loop for I2S and PDM. See the [changelog](CHANGELOG.md) for validation limits.
+
 ## What's new in 1.30
 
 Redesigned collapsible Web UI, browser listening, experimental IM73D122 PDM support,
@@ -130,7 +170,14 @@ I2S Shift, analog gain and noise performance need further investigation on the c
 
 ### PDM microphones (experimental)
 
-🟡 **Experimental on all four boards.** [IM73D122 module](https://www.aliexpress.com/item/1005010674767599.html).
+🟡 **Experimental on all four boards.** See the [microphone comparison](../README.md#microphones)
+for the recommended I2S option and the **Best quality** IM73D122 PDM option.
+
+PDM choices include **IM73D122**, **Adafruit PDM MEMS Microphone Breakout #3492 (MP34DT01-M)**
+and generic **MP34DT01 PDM modules**. Adafruit/MP34DT01 compatibility is contributor-reported;
+maintainer hardware validation is pending. These are different chips using the same PDM mode,
+not alternative names for IM73D122. Other PDM models require checking their supply rating,
+3.072 MHz clock support, left-slot output and actual hardware operation.
 
 Choose **PDM microphone (IM73D122)** under **Audio → Microphone format** after connecting
 an external PDM microphone. PDM captures mono 48 kHz audio and keeps the existing RTSP/L16
@@ -138,14 +185,14 @@ output, gain, high-pass filter and diagnostics. I2S Shift is ignored. The firmwa
 hardware conversion on XIAO ESP32-S3 and software conversion on XIAO ESP32-C3/C5/C6.
 Philips I2S remains the default; existing saved settings are retained on update.
 
-Switch power off before rewiring. For an IM73D122 breakout suitable for 3.3 V:
+Switch power off before rewiring. For a compatible PDM breakout suitable for 3.3 V:
 
 | Microphone | XIAO connection |
 | --- | --- |
-| VDD | 3V3 (verify the breakout supply specification) |
+| VDD / VCC / 3V | 3V3 (verify the breakout supply specification) |
 | GND | GND |
 | CLK | D3 |
-| DATA | D2 |
+| DATA / DAT | D2 |
 | SEL / L-R | GND (left slot) |
 
 Leave D1 (WS) and D7 (MCLK) disconnected. The PDM clock is 3.072 MHz. Different breakout
@@ -153,7 +200,7 @@ pin orders require checking their labels; the mechanical adapter is optional. Ch
 format briefly interrupts RTSP. If setup fails, format, rate and related settings roll back.
 Selecting PDM sets 48 kHz; switching back to I2S retains that rate, which can then be changed.
 
-Software conversion uses Dan Logue's v15.6 integer filter as its starting point, with streaming
+Software conversion uses the contributor's v15.6 integer filter as its starting point, with streaming
 framing and capture integration maintained here. Its useful passband is approximately 0–16 kHz
 at 48 kHz output; this is not a claim of flat response across the entire Nyquist band.
 The API reports `pdm_supported`, `pdm_decoder`, `pdm_clock_hz`, `pdm_word_stride` and
@@ -165,26 +212,74 @@ and can be corrected from the microphone signal after stride confirmation. Detec
 resets when capture restarts. Running at 160 MHz is recommended for software PDM.
 
 Use **512 samples per packet on C3/C5**. Larger buffers consume more RAM; the audio reserve
-now adapts to available internal heap, retaining 80 KiB for Wi-Fi/TCP plus the producer task
-and allocation overhead. C6/S3 retain the full reserve when memory permits. The API reports
+now adapts to available internal heap, normally retaining 80 KiB for Wi-Fi/TCP plus the producer task
+and allocation overhead. If that cannot fit, C5 alone may use the minimum reserve while still
+retaining 64 KiB plus the task and overhead; insufficient or fragmented memory is rejected.
+The C5 browser-listening queue uses 4 KiB (about 43 ms at 48 kHz); other boards use 16 KiB.
+A slow browser listener is disconnected so it cannot block RTSP. C6/S3 retain the full reserve when memory permits. The API reports
 its actual size as `rb_capacity_bytes` and recommends 512 on C3/C5 via
-`buffer_size_recommended`. Saved packet sizes are preserved, including when selecting PDM. If you previously selected
-2048, change it to 512 explicitly on C3/C5; selecting the microphone does not do this for you.
+`buffer_size_recommended`. Saved packet sizes are preserved when keeping saved values or using the legacy microphone API. If you previously selected
+2048, change it to 512 on C3/C5 or apply **Recommended settings**.
 
 All microphone paths now use integer gain and high-pass processing (`audio_dsp: "integer"`).
 PDM retains 48 kHz and a fixed PCM scale; adjust Gain for PDM, while I2S Shift remains I2S-only.
-Dan reports physical PDM tests on all four boards, including sustained C3/C5 streaming at
-512 samples; those tests used his v15.6 firmware. Our integrated image still needs physical
+When upgrading from the contributor's v15 PDM firmware, use **new Gain = old Gain × 2^(16 − old Shift)**
+as a starting point and check clipping: Shift 12 / Gain 1.5 becomes Gain 24. Saved Gain is
+not changed automatically.
+Contributor reports describe physical PDM tests on all four boards, including sustained C3/C5 streaming at
+512 samples; those tests used the contributed v15.6 firmware. Our integrated image still needs physical
 PDM validation on each board.
 
 Host signal/framing tests and board builds do not prove physical microphone compatibility.
 Maintainer PDM hardware/audio validation and long-running tests of the integrated firmware
 remain pending. PDM therefore stays experimental.
 
-Reference designs: Dan's broader PDM proposal supplied by email and
+Reference designs: the contributed PDM proposal and
 [PR #64](https://github.com/Sukecz/esp32-birdnet-mic/pull/64) (S3 hardware path).
 ESP-IDF documents [raw PDM capture](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32c6/api-reference/peripherals/i2s.html)
 and its MHz clock-rate configuration separately from PCM output sample rates.
+
+Changes are marked **Unsaved** only while they differ from the saved values. Returning to
+the saved value clears the marker and the section's discard button automatically; numeric
+formatting such as `1.50` versus `1.5` does not count as a change. Status refreshes retain
+actual drafts, including edits made while a save is still pending.
+
+### Recommended microphone settings
+
+Changing **Microphone format → Apply** opens a dialog before writing anything. It shows
+saved and recommended values for the detected board. Choose **Use recommended and save**,
+**Keep saved values and save**, or **Cancel**. **Recommended settings** opens the same
+review for the currently selected microphone. Pending audio edits are replaced only when
+applying the recommendations; keeping saved values leaves other pending edits available.
+PDM always sets 48 kHz and ignores I2S Shift, including when keeping saved values.
+
+The firmware owns one profile list used by both the preview and the save operation:
+
+| Microphone | Boards | Rate | Gain (starting value) | Packet size | I2S Shift | HPF | CPU change |
+|---|---|---|---|---|---|---|---|
+| ICS-43434 / INMP441 | C3/S3/C5/C6 | 48 kHz | 1.5 | 512 | 12 | On, 500 Hz | Keep current |
+| Adafruit SPH0645 | C3/S3/C5/C6 | 48 kHz | 1.5 | 512 | 12 | On, 500 Hz | Keep current |
+| PDM IM73D122 | C3/C5/C6 | 48 kHz | 24 | 512 | Unused; stored I2S value retained | On, 500 Hz | 160 MHz |
+| PDM IM73D122 | S3 | 48 kHz | 24 | 512 | Unused; stored I2S value retained | On, 500 Hz | Keep current |
+
+512 samples is a common starting point compatible with BirdNET-Pi UDP, and is especially
+important on C3/C5. The contributed v15.6 guidance recommends 48 kHz and 160 MHz for software PDM.
+A later integrated-firmware report supplies the Gain 24 starting value (old Shift 12 /
+Gain 1.5). Adjust Gain using Listen and the level/clipping indicator for the actual microphone
+and location; it is not an automatic level calibration. HPF 500 Hz and I2S values use this
+project's existing defaults. The profile is optional and does not run on boot or firmware update.
+
+The complete microphone/profile change restarts audio once and saves only after success.
+A failed capture or CPU change rolls back the audio parameters. The legacy `mic_format`
+API continues to preserve custom settings. Profiles can be read using
+`GET /api/microphone_profile?format=0|1|2` and saved using
+`POST /api/settings/microphone` with `format` and `settings=recommended|keep`, using
+the normal mutation header. Profile CPU value zero means keep the current setting.
+
+**Thermal management → CPU frequency** also offers **240 MHz on S3/C5**. C3/C6 are
+limited to 160 MHz. This is an optional performance setting; existing defaults remain
+160 MHz. Firmware validates the board capability before applying or loading a saved value.
+Higher frequency can increase heat; thermal-protection settings are preserved.
 
 ### XIAO Antenna Paths
 
@@ -506,12 +601,13 @@ tools/compile_firmware.sh --fqbn esp32:esp32:XIAO_ESP32C6 \
 |---|---|
 | XIAO ESP32-C3 | `esp32:esp32:XIAO_ESP32C3` |
 | XIAO ESP32-S3 | `esp32:esp32:XIAO_ESP32S3` |
-| XIAO ESP32-C5 | `esp32:esp32:XIAO_ESP32C5` |
+| XIAO ESP32-C5 | `esp32:esp32:XIAO_ESP32C5` (the helper adds `PSRAM=enabled`) |
 | XIAO ESP32-C6 | `esp32:esp32:XIAO_ESP32C6` |
 
 Change the FQBN and output folder together when building another board.
 The helper automatically enables LTO at compilation and linking for C3/C6 and isolates their
-Arduino core build artifacts. S3/C5 retain normal compilation. The all-board packaging script
+Arduino core build artifacts. For C5 it adds `PSRAM=enabled`, so the RTSP audio ring and the
+browser-listening queue use the board's 8 MB PSRAM. S3 retains normal compilation. The all-board packaging script
 and GitHub Actions use the same helper, so no per-release flag changes are needed.
 
 For OTA, open **Firmware update -> Upload compiled file** on the device and select
@@ -534,6 +630,8 @@ When changing the embedded Web UI, first regenerate its assets as described unde
 1. Open `esp32-birdnet-mic/esp32-birdnet-mic.ino`.
 2. Install an ESP32 Arduino core with support for the selected XIAO target.
 3. Select the matching board: *XIAO_ESP32C3*, *XIAO_ESP32S3*, *XIAO_ESP32C5*, or *XIAO_ESP32C6*.
+   For *XIAO_ESP32C5*, also set **Tools → PSRAM → Enabled**. Without it the C5 still works,
+   but with the adaptive internal-RAM audio buffer and listening queue (4 KB).
 4. Compile and upload over USB.
 
 Keep `build_opt.h` next to the `.ino`; it reduces the image size by disabling WiFiManager
@@ -634,7 +732,10 @@ Current validation ranges include `sampleRate=8000..192000`, `bufferSize=256..81
 - If audio is noisy while Wi-Fi is otherwise stable, try lowering Wi-Fi TX power before changing audio settings.
 - Keep I2S wires short and away from the ESP32 RF area.
 - Use shielded cable for longer microphone runs.
-- Thermal protection disables RTSP at the configured limit. Optional automatic recovery waits five continuous minutes at least 15 C below the limit. The third shutdown in a rolling 24 hours, an emergency shutdown (limit + 10 C), or a legacy latch requires manual acknowledgement after cooling. History and blocks survive reboot; without a valid clock, unknown event ages are conservatively counted for 24 hours after boot. Sensor errors reset cooling; manual server stops cancel pending automatic recovery. Recovery respects the stream schedule. The warning stays visible until acknowledged, and last-shutdown details remain available.
+- With thermal protection explicitly OFF, acknowledge a saved shutdown immediately, even if the sensor is unavailable. OFF alone does not restore streaming; acknowledgement is a separate action. With protection ON, normal cooling is still required.
+- OTA pauses capture and I2S/PDM clocks until reboot; a failed update restores capture, respecting thermal shutdown and stream schedules.
+- Temperature monitoring checks driver errors and switches between supported sensor ranges; readings remain approximate chip temperatures.
+- Thermal protection disables RTSP and capture at the configured limit. Optional automatic recovery waits five continuous minutes at least 10 C below the limit. The third shutdown in a rolling 24 hours, an emergency shutdown (limit + 10 C), or a legacy latch requires manual acknowledgement after cooling. History and blocks survive reboot; without a valid clock, unknown event ages are conservatively counted for 24 hours after boot. Sensor errors reset cooling; manual server stops cancel pending automatic recovery. Recovery respects the stream schedule. The warning stays visible until acknowledged, and last-shutdown details remain available.
 
 ## Security
 
