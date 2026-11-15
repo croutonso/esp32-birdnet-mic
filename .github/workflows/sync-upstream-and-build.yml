@@ -2,36 +2,43 @@
 #
 # Lives in YOUR fork of Sukecz/esp32-birdnet-mic.
 #
-# What it does, every scheduled run:
-#   1. Finds the newest tag on the upstream repo.
-#   2. If your branch doesn't already contain it, merges it in.
-#   3. Compiles the merged source for XIAO ESP32-C6.
-#   4. Publishes the app-only .bin as a GitHub Release on YOUR fork.
+# MANUAL ONLY. There is no schedule: nothing runs until you press
+# Actions -> sync-upstream-and-build -> Run workflow.
 #
-# You then download that .bin from your fork's Releases page and upload it
-# through birdbox2.5's own Web UI at http://<device-ip>/ota - no source
-# editing, no Arduino IDE, no USB.
+# What a run does:
+#   1. Takes the upstream tag you typed in (default v1.34).
+#   2. Merges it into your branch if it isn't already there.
+#   3. Refuses to continue if your custom pins (WS=D2, SD=D10) are missing,
+#      or if the sketch version doesn't match the tag.
+#   4. Compiles for XIAO ESP32-C6 with upstream's own tools/compile_firmware.sh
+#      (this is what turns on LTO for C3/C6 so the image fits the original
+#      1,310,720-byte OTA slot).
+#   5. Fails if the image doesn't fit; warns if headroom is under 8 KB.
+#   6. Publishes firmware-app-c6.bin as a Release on YOUR fork.
 #
-# One-time setup before the first run:
-#   - Your 2-line pin fix (I2S_LRCLK_PIN, I2S_DOUT_PIN) must already be
-#     committed on this branch.
-#   - Actions must be enabled on your fork (Actions tab -> enable).
+# Then download the .bin from your fork's Releases page and upload it through
+# birdbox2.5's own Web UI at http://<device-ip>/ota -> "Upload compiled file".
+# Do NOT use the device's "Automatic update" button: it installs the stock-pin
+# build and the microphone will go silent.
 #
-# If a scheduled run ever fails with a merge conflict, it's because upstream
-# touched one of the same lines your pin fix touches. Fix it once locally:
-#   git fetch upstream --tags && git merge <the tag it failed on>
-# resolve the 1-2 line conflict, push, and the next scheduled run resumes
-# normally from there.
+# LIMIT: use tags up to v1.34 only. v1.35 and later need upstream's pin-less
+# bridge and a partition rewrite on the device (see the guard below).
+#
+# If the merge ever fails with a conflict in a real source file:
+#   git fetch upstream --tags && git merge <tag>
+# fix the conflict (check the I2S pin lines), push, then re-run.
 
 name: sync-upstream-and-build
 
 on:
-  schedule:
-    - cron: '0 13 * * 1'   # weekly, Mondays ~6am Pacific - change to '0 13 * * *' for daily
   workflow_dispatch:
     inputs:
-      force:
-        description: 'Build even if nothing new upstream (use for the first run)'
+      tag:
+        description: 'Upstream tag to build (v1.34 is the last one that fits the original OTA slot)'
+        type: string
+        default: 'v1.34'
+      force_newer:
+        description: 'Allow tags newer than v1.34 (only if you have USB access and know the partition caveats)'
         type: boolean
         default: false
 
@@ -57,37 +64,38 @@ jobs:
           git remote add upstream https://github.com/Sukecz/esp32-birdnet-mic.git
           git fetch upstream --tags
 
-      - name: Find newest upstream release tag
-        id: latest
+      - name: Validate the requested tag
+        id: target
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          FORCE_NEWER: ${{ github.event.inputs.force_newer }}
         run: |
-          TAG=$(git for-each-ref --sort=-creatordate --format '%(refname:short)' 'refs/tags/v*' | head -1)
-          echo "Newest upstream tag: $TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Decide whether a build is needed
-        id: check
-        run: |
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            echo "Forced build requested"
-            echo "need_build=true" >> "$GITHUB_OUTPUT"
-          elif git merge-base --is-ancestor "${{ steps.latest.outputs.tag }}" HEAD; then
-            echo "Already up to date with ${{ steps.latest.outputs.tag }}, nothing to do"
-            echo "need_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New release available: ${{ steps.latest.outputs.tag }}"
-            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag '${TAG}' does not exist upstream."
+            exit 1
           fi
+          # Version-sort guard: anything above v1.34 needs the v1.35 bridge and a
+          # partition rewrite on the device, and the bridge is built with stock pins.
+          NEWEST_OK=$(printf '%s\n%s\n' "${TAG}" "v1.34" | sort -V | tail -1)
+          if [ "${NEWEST_OK}" != "v1.34" ] && [ "${FORCE_NEWER}" != "true" ]; then
+            echo "::error::${TAG} is newer than v1.34. Re-run with 'force_newer' ticked only if you intend to go through the v1.35 bridge / Prepare device path."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building ${TAG}"
 
-      - name: Merge the new release into your branch
-        # If the merge conflicts ONLY in .github/workflows/ files, resolve
-        # those automatically by keeping your versions - you never want
-        # upstream's CI files here (GITHUB_TOKEN can't push them anyway).
-        # If anything ELSE conflicts (e.g. your pin lines in the .ino),
-        # fail loudly so you can resolve it by hand instead of building
-        # something wrong.
-        if: steps.check.outputs.need_build == 'true'
+      - name: Merge the tag into your branch
+        # If the merge conflicts ONLY in .github/workflows/ files, keep your
+        # versions automatically. Any other conflict fails loudly so you can
+        # resolve it by hand instead of building something wrong.
         run: |
-          if ! git merge --no-edit "${{ steps.latest.outputs.tag }}"; then
+          TAG="${{ steps.target.outputs.tag }}"
+          if git merge-base --is-ancestor "${TAG}" HEAD; then
+            echo "${TAG} is already in your branch - no merge needed."
+            exit 0
+          fi
+          if ! git merge --no-edit "${TAG}"; then
             CONFLICTS=$(git diff --name-only --diff-filter=U)
             echo "Conflicted files:"
             echo "$CONFLICTS"
@@ -100,21 +108,14 @@ jobs:
               done
               git commit --no-edit
             else
-              echo "::error::Merge conflict in a real source file pulling ${{ steps.latest.outputs.tag }}. Resolve locally: git fetch upstream --tags && git merge ${{ steps.latest.outputs.tag }}, fix the conflict (check your I2S pin lines), push, then re-run this workflow."
+              echo "::error::Merge conflict in a real source file pulling ${TAG}. Resolve locally: git fetch upstream --tags && git merge ${TAG}, fix the conflict (check your I2S pin lines), push, then re-run this workflow."
               exit 1
             fi
           fi
 
       - name: Keep upstream's own CI workflows out of the pushed commit
-        # GITHUB_TOKEN can never be granted write access to .github/workflows/
-        # files - there is no permission key that turns this on. So after the
-        # merge, put EVERY file under .github/workflows/ back to what is
-        # already live on your repo (origin/main): files upstream changed get
-        # reverted, files upstream newly added get removed. Handles any
-        # workflow file upstream has now or adds later - no filenames to
-        # maintain. origin/main is used as the baseline (not HEAD^1) because
-        # it is correct no matter how the merge landed.
-        if: steps.check.outputs.need_build == 'true'
+        # GITHUB_TOKEN cannot push changes under .github/workflows/, so put every
+        # file there back to what is already live on origin/main.
         run: |
           for f in $(git diff --name-only origin/main HEAD -- .github/workflows/); do
             if git cat-file -e "origin/main:$f" 2>/dev/null; then
@@ -125,66 +126,83 @@ jobs:
           done
           git commit -m "Exclude upstream's CI workflows from this fork" || echo "No workflow changes to exclude this run"
 
+      - name: Guard - custom pins and version must be right
+        # A wrong-pin build flashes fine and then records silence, so check
+        # before spending build time.
+        run: |
+          set -euo pipefail
+          INO=esp32-birdnet-mic/esp32-birdnet-mic.ino
+          TAG="${{ steps.target.outputs.tag }}"
+          # Only the XIAO block (the first match of each pin) is yours to override.
+          grep -q '^static constexpr int I2S_LRCLK_PIN = D2;' "$INO" || { echo "::error::Custom WS pin (D2) missing from the XIAO pin block."; exit 1; }
+          grep -q '^static constexpr int I2S_DOUT_PIN = D10;' "$INO" || { echo "::error::Custom SD pin (D10) missing from the XIAO pin block."; exit 1; }
+          grep -q '^static constexpr int I2S_BCLK_PIN = D3;' "$INO"  || { echo "::error::BCLK is not D3 as expected."; exit 1; }
+          WANT="${TAG#v}"
+          HAVE=$(sed -n 's/^#define FW_VERSION "\(.*\)"/\1/p' "$INO" | head -1)
+          echo "Sketch FW_VERSION=${HAVE}, requested tag=${WANT}"
+          [ "$HAVE" = "$WANT" ] || { echo "::error::Sketch says ${HAVE} but you asked for ${WANT}."; exit 1; }
+
       - name: Read upstream's pinned toolchain versions
-        # Upstream pins the Arduino CLI, ESP32 core and libraries in
-        # build-dependencies.json. This matters: the app partition on the
-        # device is only 1,310,720 bytes and the firmware is within ~1% of
-        # it, so an unpinned (newer) core can add several KB and push the
-        # build over the limit ("text section exceeds available space").
-        # Reading the versions from the merged tree means this follows any
-        # future upstream bump automatically - nothing to maintain here.
-        if: steps.check.outputs.need_build == 'true'
+        # Follows whatever the merged tree pins in build-dependencies.json.
         id: deps
         run: |
           echo "cli=$(python3 -c "import json;print(json.load(open('build-dependencies.json'))['arduino_cli'])")" >> "$GITHUB_OUTPUT"
           cat build-dependencies.json
 
       - name: Set up Arduino CLI (pinned version)
-        if: steps.check.outputs.need_build == 'true'
         uses: arduino/setup-arduino-cli@v2
         with:
           version: ${{ steps.deps.outputs.cli }}
 
       - name: Install pinned ESP32 core and libraries
-        # Upstream's own script: installs exactly what build-dependencies.json
-        # lists, then verifies the installed versions match.
-        if: steps.check.outputs.need_build == 'true'
         run: python3 tools/check_build_dependencies.py --install
 
-      - name: Compile for XIAO ESP32-C6
-        if: steps.check.outputs.need_build == 'true'
+      - name: Compile for XIAO ESP32-C6 (upstream helper, LTO on)
+        # compile_firmware.sh adds -flto for C3/C6 and uses its own build path.
         run: |
-          arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 \
-            --export-binaries esp32-birdnet-mic
+          chmod +x tools/compile_firmware.sh
+          tools/compile_firmware.sh --fqbn esp32:esp32:XIAO_ESP32C6
 
-      - name: Show build output
-        # First run only: confirm this filename matches what actually got
-        # exported before trusting the "Prepare release asset" step below.
-        if: steps.check.outputs.need_build == 'true'
-        run: find esp32-birdnet-mic/build -maxdepth 2 -type f
-
-      - name: Prepare release asset
-        if: steps.check.outputs.need_build == 'true'
+      - name: Prepare release asset and check size
         run: |
-          cp esp32-birdnet-mic/build/esp32.esp32.XIAO_ESP32C6/esp32-birdnet-mic.ino.bin \
-             firmware-app-c6.bin
+          set -euo pipefail
+          BIN=$(find esp32-birdnet-mic/build -type f -name 'esp32-birdnet-mic.ino.bin' | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::App binary not found. Build output:"
+            find esp32-birdnet-mic/build -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+          echo "Using $BIN"
+          cp "$BIN" firmware-app-c6.bin
+          LIMIT=1310720
           SIZE=$(stat -c%s firmware-app-c6.bin)
-          echo "firmware-app-c6.bin: $SIZE bytes, headroom under 1310720 limit: $((1310720 - SIZE)) bytes"
+          ROOM=$((LIMIT - SIZE))
+          echo "firmware-app-c6.bin: ${SIZE} bytes, headroom under ${LIMIT}: ${ROOM} bytes"
+          if [ "$ROOM" -lt 0 ]; then
+            echo "::error::Image is ${SIZE} bytes, larger than the original ${LIMIT}-byte OTA slot. Do not flash."
+            exit 1
+          fi
+          if [ "$ROOM" -lt 8192 ]; then
+            echo "::warning::Only ${ROOM} bytes of headroom in the OTA slot."
+          fi
+          sha256sum firmware-app-c6.bin | tee firmware-app-c6.bin.sha256
 
       - name: Push merged source to your fork
-        if: steps.check.outputs.need_build == 'true'
         run: git push origin HEAD:main
 
       - name: Publish as a GitHub Release
-        if: steps.check.outputs.need_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: custom-${{ steps.latest.outputs.tag }}
-          name: birdbox2.5 build (upstream ${{ steps.latest.outputs.tag }})
+          tag_name: custom-${{ steps.target.outputs.tag }}
+          name: birdbox2.5 build (upstream ${{ steps.target.outputs.tag }})
           body: |
-            Auto-built from Sukecz/esp32-birdnet-mic ${{ steps.latest.outputs.tag }}
-            with your custom I2S pin overrides (WS -> D2, SD -> D10) applied.
+            Built from Sukecz/esp32-birdnet-mic ${{ steps.target.outputs.tag }}
+            with your custom I2S pin overrides (WS -> D2, SD -> D10) verified,
+            using upstream's pinned toolchain and LTO helper.
 
             Download firmware-app-c6.bin below and upload it at
             http://<birdbox2.5-ip>/ota -> "Upload compiled file".
-          files: firmware-app-c6.bin
+            Do not use "Automatic update" - it installs the stock-pin build.
+          files: |
+            firmware-app-c6.bin
+            firmware-app-c6.bin.sha256
